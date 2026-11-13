@@ -2,8 +2,14 @@ name: Build danmu-api for UZN
 
 # 为 UZN app 构建打包产物并发布到固定的 latest Release
 # push 到 main 即自动构建，产物覆盖更新到同一个 Release（下载链接不变）；也可手动触发
-# 注意：Fork Sync 用 GITHUB_TOKEN 推送的 commit 不会触发 push 事件（GitHub 安全机制），
-# 因此 Fork Sync 同步成功后会发 repository_dispatch 来触发本 workflow
+#
+# 触发方式有四条，互为兜底：
+#   1) push 到 main                    —— 你自己直接改代码时触发
+#   2) repository_dispatch(upstream-synced) —— Fork Sync 同步成功后主动通知
+#      （GITHUB_TOKEN 推的 commit 不会触发 push 事件，所以要显式发 dispatch）
+#   3) workflow_run(Fork Sync completed)    —— 万一上面那条 dispatch 因为权限/网络失败，
+#      这里兜底：只要 Fork Sync 跑完（且成功）就构建
+#   4) workflow_dispatch               —— 手动点按钮
 on:
   push:
     branches:
@@ -11,6 +17,10 @@ on:
   repository_dispatch:
     types:
       - upstream-synced
+  workflow_run:
+    workflows: ["Fork Sync"]
+    types:
+      - completed
   workflow_dispatch:
 
 permissions:
@@ -20,10 +30,18 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
 
+    # 由 workflow_run 触发时，只有 Fork Sync 成功才继续（失败/取消都跳过，避免用坏代码打包）
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
     steps:
       # 检出代码
+      # workflow_run 事件下默认检出的是默认分支 HEAD，正是我们想要的最新 main
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       # 安装 Node（打包脚本与产物运行环境无关，target 为 node18）
       - name: Setup Node.js
@@ -39,8 +57,32 @@ jobs:
       - name: Build bundle
         run: node build-for-uzn.mjs
 
+      # 比对本次构建产物与已发布版本的 md5：
+      # 内容没变就不重复上传，避免每天定时同步都刷一次 Release（省 Actions 额度、少噪音）
+      - name: Check if bundle changed
+        id: diff
+        run: |
+          set -euo pipefail
+          NEW=$(tr -d '[:space:]' < dist/danmu_api_server.cjs.md5)
+          OLD=$(curl -fsSL --max-time 30 \
+            "https://github.com/${{ github.repository }}/releases/download/latest/danmu_api_server.cjs.md5" \
+            2>/dev/null | tr -d '[:space:]' || true)
+          # 只接受 32 位十六进制，防止把错误页/空响应当成「旧版本」从而误跳过发布
+          if ! printf '%s' "${OLD:-}" | grep -Eq '^[0-9a-f]{32}$'; then
+            OLD=""
+          fi
+          echo "本次构建 md5 : $NEW"
+          echo "当前发布 md5 : ${OLD:-<尚无 Release>}"
+          if [ -n "$OLD" ] && [ "$NEW" = "$OLD" ]; then
+            echo "内容未变化，跳过发布"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # 上传两个构建产物到固定的 latest Release（同名资产自动覆盖）
       - name: Upload artifacts to Release
+        if: steps.diff.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
@@ -49,6 +91,7 @@ jobs:
             每次推送 main 分支后自动构建并覆盖更新，下载链接固定不变。
 
             - 构建提交: ${{ github.sha }}
+            - 触发方式: ${{ github.event_name }}
 
             ## 使用说明（UZN 网络订阅源）
 
